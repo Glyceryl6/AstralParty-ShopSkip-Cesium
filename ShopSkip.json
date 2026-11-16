@@ -1,0 +1,10 @@
+{
+  "id": "ShopSkip",
+  "name": "商店跳过",
+  "version": "0.1.0",
+  "author": "Glyceryl6",
+  "description": "在经过卡牌商店和筹码商店时，如果自身的星币不足以购买，则会自动跳过。",
+  "permissions": 1,
+  "sdkVersion": "3.6.0",
+  "dependencies": []
+}
