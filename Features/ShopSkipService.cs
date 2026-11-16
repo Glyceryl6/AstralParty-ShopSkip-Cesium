@@ -75,7 +75,7 @@ internal sealed class ShopSkipService {
             if (window != null) _handledPurchases.Remove(window);
             return;
         }
-            
+
         if (_handledPurchases.Contains(window)) return;
         GRichTextField? priceText;
         GButton? cancel;
