@@ -2,86 +2,122 @@ using System;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Text.RegularExpressions;
+using FairyGUI;
 using GameLogic;
 using UI;
 using UnityEngine;
 
-namespace ShopSkip.Features {
-    /// <summary>
-    /// 只跳过已确认无法购买的卡牌商店与遗物购买。遇到不完整数据不操作，
-    /// 仅调用原版离开／取消按钮，不发送自定义购买协议。
-    /// </summary>
-    internal sealed class ShopSkipService {
-        private static readonly BindingFlags Private = BindingFlags.NonPublic | BindingFlags.Instance;
-        private static readonly FieldInfo? ShopCache = typeof(UIManager).GetField("_cachedLandShopWindow", Private);
-        private static readonly FieldInfo? RelicCache = typeof(UIManager).GetField("_cacheLandRelicWindow", Private);
-        private static readonly FieldInfo? ShoppingPlayer = typeof(LandShopWindow).GetField("shoppingPlayer", Private);
-        private static readonly FieldInfo? CardGoods = typeof(LandShopWindow).GetField("CardGoods", Private);
-        private static readonly FieldInfo? AlreadyCards = typeof(LandShopWindow).GetField("alreadyCards", Private);
-        private LandShopWindow? _handledShop;
-        private LandRelicWindow? _handledRelic;
-        private float _nextPoll;
+namespace ShopSkip.Features;
 
-        internal void Tick() {
-            if (Time.realtimeSinceStartup < _nextPoll) return;
-            _nextPoll = Time.realtimeSinceStartup + .22f;
-            if (!UIManager.hasInstance) { Reset(); return; }
-            try {
-                UIManager manager = UIManager.inst;
-                // 不访问 UIManager.landShop/landRelic 属性，避免主界面提前创建窗口。
-                LandShopWindow? shop = ShopCache?.GetValue(manager) as LandShopWindow;
-                LandRelicWindow? relic = RelicCache?.GetValue(manager) as LandRelicWindow;
-                if (shop is not { isShowing: true }) _handledShop = null;
-                else if (!ReferenceEquals(shop, _handledShop)) TrySkipCards(shop);
-                if (relic is not { isShowing: true }) _handledRelic = null;
-                else if (!ReferenceEquals(relic, _handledRelic)) TrySkipRelic(relic);
-            } catch (Exception) {
-                // 运行时数据未就绪时保留原游戏行为；下一次轮询重试。
-            }
-        }
+/// <summary>
+/// Skip only confirmed unaffordable purchases. Never obtain UIManager
+/// window properties here: the game's property getters instantiate windows.
+/// </summary>
+internal sealed class ShopSkipService {
+    private const BindingFlags Private = BindingFlags.NonPublic | BindingFlags.Instance;
+    private static readonly FieldInfo? ShopCache = typeof(UIManager).GetField("_cachedLandShopWindow", Private);
+    private static readonly FieldInfo? RelicCache = typeof(UIManager).GetField("_cacheLandRelicWindow", Private);
+    private static readonly FieldInfo? VendorCache = typeof(UIManager).GetField("_cacheLandVendorWindow", Private);
+    private static readonly FieldInfo? BuildShopCache = typeof(UIManager).GetField("_cachedLandBuildShopWindow", Private);
+    private static readonly FieldInfo? ShoppingPlayer = typeof(LandShopWindow).GetField("shoppingPlayer", Private);
+    private static readonly FieldInfo? CardGoods = typeof(LandShopWindow).GetField("CardGoods", Private);
+    private static readonly FieldInfo? AlreadyCards = typeof(LandShopWindow).GetField("alreadyCards", Private);
 
-        private void TrySkipCards(LandShopWindow window) {
-            if (ShoppingPlayer == null || CardGoods == null || AlreadyCards == null ||
-                window.contentPane is not UILandShopWindow pane) return;
-            var player = ShoppingPlayer.GetValue(window) as BattlePlayerData;
-            var goods = CardGoods.GetValue(window) as List<(int, int)>;
-            var sold = AlreadyCards.GetValue(window) as Google.Protobuf.Collections.RepeatedField<bool>;
-            if (player == null || goods == null || goods.Count == 0 ||
-                (sold != null && goods.Count > sold.Count) || goods.Count > 32 || 
-                pane.btn_Leave is not { visible: true } || pane.btn_Leave.grayed) return;
-            int gold = player.Property.gold.Value;
-            if (gold < 0) return;
-            int available = 0;
-            foreach (int index in Indices(goods.Count)) {
-                if (sold != null && sold[index]) continue;
-                int cost = goods[index].Item2;
-                if (cost is < 0 or > 100000000) return;
-                available++;
-                if (cost <= gold) return;
-            }
-            // 已售罄商品也不用额外触发“离开”；只处理剩余但无法购买的情况。
-            if (available == 0) return;
-            _handledShop = window;
-            pane.btn_Leave.onClick.Call();
-        }
+    private readonly HashSet<BaseWindow> _handledPurchases = [];
+    private LandShopWindow? _handledShop;
+    private float _nextPoll;
 
-        private void TrySkipRelic(LandRelicWindow window) {
-            if (window.contentPane is not UILandRelicWindow pane || pane.btn_Sure?.txt_Desc == null || 
-                pane.btn_Cancel is not { visible: true } || pane.btn_Cancel.grayed || !GameLogicManager.hasInstance) return;
-            // 与旧版一致：只能从已经 FlushVars 的实际渲染文本中读取需支付金币。
-            string html = pane.btn_Sure.txt_Desc.richTextField?.htmlText ?? "";
-            string visibleText = Regex.Replace(html, "<[^>]+>", "");
-            MatchCollection prices = Regex.Matches(visibleText, @"\d+");
-            if (prices.Count != 1 || !int.TryParse(prices[0].Value, out var price) || price < 0) return;
-            BattlePlayerData? self = GameLogicManager.inst.battle?.GetSelfPlayerData();
-            if (self == null || self.Property.gold.Value >= price) return;
-            _handledRelic = window;
-            pane.btn_Cancel.onClick.Call();
+    internal void Tick() {
+        if (Time.realtimeSinceStartup < _nextPoll) return;
+        _nextPoll = Time.realtimeSinceStartup + .22f;
+        if (!UIManager.hasInstance) { Reset(); return; }
+        try {
+            UIManager manager = UIManager.inst;
+            if (ShopCache?.GetValue(manager) is not LandShopWindow { isShowing: true } shop) _handledShop = null;
+            else if (!ReferenceEquals(shop, _handledShop)) TrySkipCards(shop);
+            // All three optional land-purchase windows share the same
+            // native confirmation/cancellation flow and price text.
+            CheckPurchase(RelicCache?.GetValue(manager) as LandRelicWindow);
+            CheckPurchase(VendorCache?.GetValue(manager) as LandVendorWindow);
+            CheckPurchase(BuildShopCache?.GetValue(manager) as LandBuildShopWindow);
+        } catch (Exception) {
+            // The original window may be midway through initialization.
+            // Preserve game behavior and retry the next poll.
         }
-
-        private static IEnumerable<int> Indices(int count) {
-            for (int i = 0; i < count; i++) yield return i;
-        }
-        internal void Reset() { _handledShop = null; _handledRelic = null; _nextPoll = 0f; }
     }
+
+    private void TrySkipCards(LandShopWindow window) {
+        if (ShoppingPlayer == null || CardGoods == null || AlreadyCards == null ||
+            window.contentPane is not UILandShopWindow pane) return;
+        var player = ShoppingPlayer.GetValue(window) as BattlePlayerData;
+        var goods = CardGoods.GetValue(window) as List<(int, int)>;
+        var sold = AlreadyCards.GetValue(window) as Google.Protobuf.Collections.RepeatedField<bool>;
+        if (player == null || goods == null || goods.Count == 0 || 
+            (sold != null && goods.Count > sold.Count) || goods.Count > 32 
+            || pane.btn_Leave is not { visible: true } || pane.btn_Leave.grayed) return;
+        int gold = player.Property.gold.Value;
+        if (gold < 0) return;
+        int available = 0;
+        for (int i = 0; i < goods.Count; i++) {
+            if (sold != null && sold[i]) continue;
+            int cost = goods[i].Item2;
+            if (cost is < 0 or > 100000000) return;
+            available++;
+            if (cost <= gold) return;
+        }
+        if (available == 0) return;
+        _handledShop = window;
+        pane.btn_Leave.onClick.Call();
+    }
+
+    private void CheckPurchase(BaseWindow? window) {
+        if (window is not { isShowing: true }) {
+            if (window != null) _handledPurchases.Remove(window);
+            return;
+        }
+            
+        if (_handledPurchases.Contains(window)) return;
+        GRichTextField? priceText;
+        GButton? cancel;
+        // Only the generated native fields differ between these windows.
+        switch (window.contentPane) {
+            case UILandRelicWindow relic:
+                priceText = relic.btn_Sure?.txt_Desc;
+                cancel = relic.btn_Cancel;
+                break;
+            case UILandVendorWindow vendor:
+                priceText = vendor.btn_Sure?.txt_Desc;
+                cancel = vendor.btn_Cancel;
+                break;
+            case UILandBuildShopWindow build:
+                priceText = build.btn_Sure?.txt_Desc;
+                cancel = build.btn_Cancel;
+                break;
+            default:
+                return;
+        }
+        
+        TrySkipPurchase(window, priceText, cancel);
+    }
+
+    private void TrySkipPurchase(BaseWindow window, GRichTextField? priceLabel, GButton? cancel) {
+        if (priceLabel == null || cancel is not { visible: true } || cancel.grayed || !GameLogicManager.hasInstance) return;
+        // Like the old MOD, read only the already FlushVars-rendered cost.
+        // Do not infer a price from uninitialized template placeholders.
+        string html = priceLabel.richTextField?.htmlText ?? "";
+        string visible = Regex.Replace(html, "<[^>]+>", "");
+        MatchCollection numbers = Regex.Matches(visible, @"\d+");
+        if (numbers.Count != 1 || !int.TryParse(numbers[0].Value, out int price) || price < 0) return;
+        BattlePlayerData? self = GameLogicManager.inst.battle?.GetSelfPlayerData();
+        if (self == null || self.Property.gold.Value >= price) return;
+        _handledPurchases.Add(window);
+        cancel.onClick.Call();
+    }
+
+    internal void Reset() {
+        _handledShop = null;
+        _handledPurchases.Clear();
+        _nextPoll = 0f;
+    }
+        
 }
