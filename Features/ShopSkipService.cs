@@ -20,6 +20,7 @@ internal sealed class ShopSkipService {
     private const int MaxReasonablePrice = 100_000_000;
 
     private static readonly FieldInfo? ShopCache = typeof(UIManager).GetField("_cachedLandShopWindow", Private);
+    private static readonly FieldInfo? AtmCache = typeof(UIManager).GetField("_cachedATMWindow", Private);
     private static readonly FieldInfo? RelicCache = typeof(UIManager).GetField("_cacheLandRelicWindow", Private);
     private static readonly FieldInfo? VendorCache = typeof(UIManager).GetField("_cacheLandVendorWindow", Private);
     private static readonly FieldInfo? BuildShopCache = typeof(UIManager).GetField("_cachedLandBuildShopWindow", Private);
@@ -32,6 +33,9 @@ internal sealed class ShopSkipService {
 
     private readonly HashSet<BaseWindow> _handledPurchases = [];
     private LandShopWindow? _handledShop;
+    private long _handledAtmSn;
+    private long _observedAtmSn;
+    private float _observedAtmSince;
     private float _nextPoll;
 
     internal void Tick() {
@@ -44,6 +48,10 @@ internal sealed class ShopSkipService {
                 _handledShop = null;
             else if (!ReferenceEquals(shop, _handledShop))
                 TrySkipCards(shop);
+
+            // A PVE transfer returns a new shop action while the ATM remains visible.
+            // Evaluate the *refreshed server offer*, not prices cached before transfer.
+            TrySkipAfterTransfer(AtmCache?.GetValue(manager) as ATMWindow);
 
             // Preserve the previous window-based fallback. We cannot reliably suppress
             // ShowPurchase/TryShow using the observational SDK event hooks.
@@ -126,6 +134,67 @@ internal sealed class ShopSkipService {
         return offer.AssistGold < 0 || gold >= offer.AssistGold;
     }
 
+    private void TrySkipAfterTransfer(ATMWindow? atm) {
+        if (atm is not { isShowing: true }) {
+            _handledAtmSn = 0L;
+            _observedAtmSn = 0L;
+            return;
+        }
+        if (!GameLogicManager.hasInstance || atm.contentPane is not UIATMWindow pane ||
+            pane.btn_Leave is not { visible: true } || pane.btn_Leave.grayed) return;
+
+        var manager = GameLogicManager.inst;
+        var land = manager.land;
+        var action = land?.CardShopAction;
+        PVEShopBuyC2S? offer = land?.PVEShopData;
+        if (action == null || action.Id != 5215 || action.Sn == 0L ||
+            action.Sn == _handledAtmSn ||
+            offer == null || offer.AssistPlayer == 0L) return;
+
+        BattlePlayerData? self = manager.battle?.GetSelfPlayerData();
+        if (self == null || action.PlayerId != self.player.Id) return;
+        // Allow the gold/offer UI to settle after receiving the new action.
+        if (_observedAtmSn != action.Sn) {
+            _observedAtmSn = action.Sn;
+            _observedAtmSince = Time.realtimeSinceStartup;
+            return;
+        }
+        if (Time.realtimeSinceStartup - _observedAtmSince < .25f) return;
+        StockState state = EvaluatePveOffer(offer, self.Property.gold.Value);
+        if (state != StockState.SoldOut && state != StockState.Unaffordable) return;
+
+        // The ATM's native leave handler issues the required isClose request.
+        // Only a new, post-transfer action Sn can be used here.
+        _handledAtmSn = action.Sn;
+        pane.btn_Leave.onClick.Call();
+    }
+
+    private static StockState EvaluatePveOffer(PVEShopBuyC2S offer, int gold) {
+        if (gold < 0 || offer.Cards.Count == 0 || offer.Cards.Count > 32 ||
+            offer.Alreadys.Count != offer.Cards.Count) return StockState.Unknown;
+
+        int freePrice = 0;
+        if (StaticConfigure.Skill.InfoDict.TryGetValue(10112, out var skill)) {
+            foreach (int param in skill.Params) freePrice = param;
+        }
+
+        bool hasUnsold = false;
+        for (int i = 0; i < offer.Cards.Count; i++) {
+            if (offer.Alreadys[i]) continue;
+            hasUnsold = true;
+            bool discountedFree = offer.TalentSkillFreeCard.Count > i && offer.TalentSkillFreeCard[i];
+            // Match LandShopWindow.UpdatePVECardShopData, including special free
+            // card pricing. Use long math to avoid int overflow on bad data.
+            long price = discountedFree
+                ? Math.Max(0L, (long)freePrice - offer.DisCountGold)
+                : (long)offer.Gold - offer.DisCountGold;
+            if (price < 0) return StockState.Buyable;
+            if (price > MaxReasonablePrice) return StockState.Unknown;
+            if (price <= gold) return StockState.Buyable;
+        }
+        return hasUnsold ? StockState.Unaffordable : StockState.SoldOut;
+    }
+
     private void CheckPurchase(BaseWindow? window) {
         if (window is not { isShowing: true }) {
             if (window != null) _handledPurchases.Remove(window);
@@ -167,6 +236,9 @@ internal sealed class ShopSkipService {
 
     internal void Reset() {
         _handledShop = null;
+        _handledAtmSn = 0L;
+        _observedAtmSn = 0L;
+        _observedAtmSince = 0f;
         _handledPurchases.Clear();
         _nextPoll = 0f;
     }
