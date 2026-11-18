@@ -24,10 +24,10 @@
 启用实验需要：
 
 1. 在 `AstralParty_ModLoader/mods/ShopSkip/` 新建空文件 `experimental-early-skip.enable`（无需改源码）。
-2. 该目录需要有**与当前游戏运行时兼容**的 Harmony / HarmonyX `0Harmony.dll`（或者运行时已预先加载同一程序集）。本 Mod 不附带也不保证此依赖在 HybridCLR 中可用。
+2. **编译时**需在项目中引用 `0Harmony.dll`，**运行时**也必须能加载兼容的 `0Harmony.dll`（例如部署在加载器能够解析程序集依赖的位置）。本 Mod 不附带该 DLL，也不保证其能够拦截 HybridCLR 热更新方法；不再通过反射动态查找或 `Assembly.LoadFrom` 加载 Harmony。
 3. 彻底重启游戏，进入**单人模式**。查看本次启动的 `AstralParty_ModLoader/logs/`：`[ShopSkip.EarlyTest]` 记录是否安装、是否**真正进入 Prefix**以及是否提前跳过。只有“已进入前置 Prefix”才说明拦截方法被执行。
 4. 想关闭时删除 `experimental-early-skip.enable`，重启游戏即可。退出单人场景或卸载模组时也会尝试只移除本 Mod 的补丁，不会全局卸载其他模组的补丁。
 
-**注意：**IL2CPP + HybridCLR 与通常的 Unity Mono 不同，Harmony 即使显示注册成功也**不保证拦截到解释执行的热更新方法**；安装或卸载补丁也可能失败。若缺少依赖或补丁安装失败，实验功能自动不启用，仍由现有窗口内判断处理。不要在多人真实对局中启用。本项目不使用 P/Invoke、内存地址硬编码、DLL 字节修改，也不在当前版本假定 SDK 已支持方法拦截。
+**注意：**IL2CPP + HybridCLR 与通常的 Unity Mono 不同，Harmony 即使显示注册成功也**不保证拦截到解释执行的热更新方法**；安装或卸载补丁也可能失败。**与此前动态加载版本不同，直接引用 Harmony 后，若运行时缺少 DLL，Mod 可能无法正常加载；不能依赖实验开关解决缺失程序集的问题。** 补丁安装失败时，仍由现有窗口内判断处理。不要在多人真实对局中启用。本项目不使用 P/Invoke、内存地址硬编码、DLL 字节修改，也不在当前版本假定 SDK 已支持方法拦截。
 
 计划向 CesiumLoader SDK 贡献的能力：提供由加载器负责、可注销且按模组隔离的“执行前决策”接口，支持明确的 `Continue/SkipOriginal`，并在跳过时由调用方提供合法返回值；必须保留主线程调度、异常隔离、热更新方法兼容性、安装/卸载和多模组冲突测试。
