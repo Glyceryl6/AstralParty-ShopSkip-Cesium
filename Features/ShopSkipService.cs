@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Reflection;
-using System.Text.RegularExpressions;
 using FairyGUI;
 using GameLogic;
 using Google.Protobuf.Collections;
@@ -12,8 +11,8 @@ using UnityEngine;
 namespace ShopSkip.Features;
 
 /// <summary>
-/// Use the game's own Leave / Cancel handlers after confirming affordability.
-/// Access UIManager's existing caches only: its public window getters create windows.
+/// Card shop and ATM only. Other shop windows are handled independently by
+/// ShopWindowFallbackService so the experimental prefix can be tested in isolation.
 /// </summary>
 internal sealed class ShopSkipService {
     private const BindingFlags Private = BindingFlags.NonPublic | BindingFlags.Instance;
@@ -21,9 +20,6 @@ internal sealed class ShopSkipService {
 
     private static readonly FieldInfo? ShopCache = typeof(UIManager).GetField("_cachedLandShopWindow", Private);
     private static readonly FieldInfo? AtmCache = typeof(UIManager).GetField("_cachedATMWindow", Private);
-    private static readonly FieldInfo? RelicCache = typeof(UIManager).GetField("_cacheLandRelicWindow", Private);
-    private static readonly FieldInfo? VendorCache = typeof(UIManager).GetField("_cacheLandVendorWindow", Private);
-    private static readonly FieldInfo? BuildShopCache = typeof(UIManager).GetField("_cachedLandBuildShopWindow", Private);
     private static readonly FieldInfo? ShoppingPlayer = typeof(LandShopWindow).GetField("shoppingPlayer", Private);
     private static readonly FieldInfo? CardGoods = typeof(LandShopWindow).GetField("CardGoods", Private);
     private static readonly FieldInfo? AlreadyCards = typeof(LandShopWindow).GetField("alreadyCards", Private);
@@ -31,7 +27,6 @@ internal sealed class ShopSkipService {
 
     private enum StockState { Unknown, Buyable, SoldOut, Unaffordable }
 
-    private readonly HashSet<BaseWindow> _handledPurchases = [];
     private LandShopWindow? _handledShop;
     private long _handledAtmSn;
     private long _observedAtmSn;
@@ -53,11 +48,6 @@ internal sealed class ShopSkipService {
             // Evaluate the *refreshed server offer*, not prices cached before transfer.
             TrySkipAfterTransfer(AtmCache?.GetValue(manager) as ATMWindow);
 
-            // Preserve the previous window-based fallback. We cannot reliably suppress
-            // ShowPurchase/TryShow using the observational SDK event hooks.
-            CheckPurchase(RelicCache?.GetValue(manager) as LandRelicWindow);
-            CheckPurchase(VendorCache?.GetValue(manager) as LandVendorWindow);
-            CheckPurchase(BuildShopCache?.GetValue(manager) as LandBuildShopWindow);
         } catch (Exception) {
             // A window or server action may still be initializing. Retry next poll.
         }
@@ -195,51 +185,11 @@ internal sealed class ShopSkipService {
         return hasUnsold ? StockState.Unaffordable : StockState.SoldOut;
     }
 
-    private void CheckPurchase(BaseWindow? window) {
-        if (window is not { isShowing: true }) {
-            if (window != null) _handledPurchases.Remove(window);
-            return;
-        }
-        if (_handledPurchases.Contains(window)) return;
-        GRichTextField? priceText;
-        GButton? cancel;
-        switch (window.contentPane) {
-            case UILandRelicWindow relic:
-                priceText = relic.btn_Sure?.txt_Desc;
-                cancel = relic.btn_Cancel;
-                break;
-            case UILandVendorWindow vendor:
-                priceText = vendor.btn_Sure?.txt_Desc;
-                cancel = vendor.btn_Cancel;
-                break;
-            case UILandBuildShopWindow build:
-                priceText = build.btn_Sure?.txt_Desc;
-                cancel = build.btn_Cancel;
-                break;
-            default: return;
-        }
-        TrySkipPurchase(window, priceText, cancel);
-    }
-
-    private void TrySkipPurchase(BaseWindow window, GRichTextField? priceLabel, GButton? cancel) {
-        if (priceLabel == null || cancel is not { visible: true } || cancel.grayed ||
-            !GameLogicManager.hasInstance) return;
-        string html = priceLabel.richTextField?.htmlText ?? "";
-        string visible = Regex.Replace(html, "<[^>]+>", "");
-        MatchCollection numbers = Regex.Matches(visible, @"\d+");
-        if (numbers.Count != 1 || !int.TryParse(numbers[0].Value, out int price) || price < 0) return;
-        BattlePlayerData? self = GameLogicManager.inst.battle?.GetSelfPlayerData();
-        if (self == null || self.Property.gold.Value >= price) return;
-        _handledPurchases.Add(window);
-        cancel.onClick.Call();
-    }
-
     internal void Reset() {
         _handledShop = null;
         _handledAtmSn = 0L;
         _observedAtmSn = 0L;
         _observedAtmSince = 0f;
-        _handledPurchases.Clear();
         _nextPoll = 0f;
     }
 }
