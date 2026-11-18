@@ -12,7 +12,6 @@ namespace ShopSkip {
         public override void OnInitialize() {
             _service = new ShopSkipService();
             _early = new ExperimentalEarlyShopSkipService();
-            _early.Initialize();
         }
         public override void OnUpdate() {
             _early?.Tick();

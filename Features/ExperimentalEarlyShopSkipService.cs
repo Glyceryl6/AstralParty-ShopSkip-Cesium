@@ -1,8 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
-using System.Reflection;
+using HarmonyLib;
 using CesiumLoader.SDK;
 using CesiumLoader.SDK.Logging;
 using Core.Net;
@@ -16,147 +15,87 @@ namespace ShopSkip.Features;
 
 /// <summary>
 /// Optional SINGLE-PLAYER-only prefix experiment. Never enabled by default.
-/// No hard Harmony reference: an unsupported HybridCLR runtime simply keeps
-/// the normal post-window ShopSkipService path intact.
+/// Uses the referenced HarmonyLib API directly. The patch remains opt-in,
+/// SINGLE-PLAYER-only, and preserves the normal post-window fallback.
 ///
-/// Requires an opt-in marker named experimental-early-skip.enable next to the
-/// mod DLL. An optional local 0Harmony.dll may be supplied for trial loading.
-/// Removing the marker and restarting completely disables this feature.
+/// Requires a compile-time reference to 0Harmony.dll and the same compatible
+/// assembly at runtime. Create experimental-early-skip.enable next to the mod
+/// DLL to opt in; remove it and restart to disable.
 /// </summary>
 internal sealed class ExperimentalEarlyShopSkipService {
     private const string Tag = "ShopSkip.EarlyTest";
     private const string PatchId = "ShopSkip.ExperimentalEarlyShopSkip.v1";
-    private const string EnableMarker = "experimental-early-skip.enable";
-    private const string HarmonyLibrary = "0Harmony.dll";
     private const int MaxReasonablePrice = 100_000_000;
 
     private static ExperimentalEarlyShopSkipService? _active;
-    private readonly HashSet<long> _completedActions = new HashSet<long>();
+    private readonly HashSet<long> _completedActions = [];
     private bool _enabled;
     private bool _attempted;
     private bool _installed;
     private bool _prefixSeen;
-    private object? _harmony;
-    private MethodInfo? _unpatch;
-    private object[]? _unpatchArgs;
-
-    internal void Initialize() {
-        // SDK path discovery is essential in HybridCLR: Assembly.Location and
-        // AppDomain.BaseDirectory may point to the wrong directory or be empty.
-        try {
-            string modDirectory = Path.Combine(SdkPath.ModsDirectory, "ShopSkip");
-            _enabled = File.Exists(Path.Combine(modDirectory, EnableMarker));
-            if (_enabled) SdkLog.Warn(Tag,
-                "已发现实验开关。仅在单人模式尝试安装前置拦截；失败会保留原窗口取消功能。");
-        } catch (Exception ex) {
-            _enabled = false;
-            SdkLog.Warn(Tag, "无法读取实验开关，保持关闭：" + ex.Message);
-        }
-    }
+    private Harmony? _harmony;
 
     internal void Tick() {
-        if (!_enabled) return;
-        if (_installed || _attempted) return;
-        _attempted = true;
-        TryInstall();
+        if (!_installed && !_attempted) {
+            _attempted = true;
+            TryInstall();
+        }
     }
 
     private void TryInstall() {
         try {
-            string modDirectory = Path.Combine(SdkPath.ModsDirectory, "ShopSkip");
-            Assembly? harmonyAssembly = AppDomain.CurrentDomain.GetAssemblies()
-                .FirstOrDefault(a => a.GetType("HarmonyLib.Harmony", false) != null);
-            if (harmonyAssembly == null) {
-                string dll = Path.Combine(modDirectory, HarmonyLibrary);
-                if (!File.Exists(dll)) {
-                    SdkLog.Warn(Tag, "找不到已加载的 Harmony，也没有本地 0Harmony.dll。前置拦截未启用。");
-                    return;
-                }
-                // Experimental only. Assembly.LoadFrom can itself be unsupported
-                // by an IL2CPP/HybridCLR build; failure is handled here.
-                harmonyAssembly = Assembly.LoadFrom(dll);
-            }
-
-            Type? harmonyType = harmonyAssembly.GetType("HarmonyLib.Harmony", false);
-            Type? methodType = harmonyAssembly.GetType("HarmonyLib.HarmonyMethod", false);
-            if (harmonyType == null || methodType == null)
-                throw new InvalidOperationException("Harmony 类型不可用");
-
-            _harmony = Activator.CreateInstance(harmonyType, new object[] { PatchId });
-            if (_harmony == null) throw new InvalidOperationException("无法创建 Harmony 实例");
-            ResolveUnpatch(harmonyType);
-            if (_unpatch == null) throw new NotSupportedException("找不到仅卸载本 Mod 补丁的 API");
-
-            MethodInfo? patch = harmonyType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
-                .FirstOrDefault(m => m.Name == "Patch" &&
-                    m.GetParameters().Length >= 2 &&
-                    m.GetParameters()[0].ParameterType == typeof(MethodBase) &&
-                    m.GetParameters()[1].ParameterType == methodType);
-            if (patch == null) throw new NotSupportedException("当前 Harmony 没有可用的 Patch API");
-
-            Patch(patch, methodType, typeof(LandRelicWindow), "ShowPurchase", nameof(RelicPrefix));
-            Patch(patch, methodType, typeof(LandVendorWindow), "ShowVendorBuyCard", nameof(VendorPrefix));
-            Patch(patch, methodType, typeof(LandBuildShopWindow), "ShowPurchase", nameof(BuildPrefix));
+            // Only patch these three windows. PatchAll(assembly) might also
+            // install other modules' annotated patches, so avoid it here.
+            _harmony = new Harmony(PatchId);
+            InstallPatch(typeof(RelicPurchasePatch));
+            InstallPatch(typeof(VendorPurchasePatch));
+            InstallPatch(typeof(BuildPurchasePatch));
 
             _active = this;
             _installed = true;
-            SdkLog.Warn(Tag, "已向 Harmony 注册三个商店入口（不代表 HybridCLR 已成功执行补丁）。" +
-                "请观察首次触发的 Prefix 日志；无日志则仍使用原功能。");
+            SdkLog.Warn(Tag, "Harmony 已注册三个商店入口（不代表 HybridCLR 已执行补丁）。" +
+                "请观察首次触发的 Prefix 日志；没有日志则仍使用原功能。");
         } catch (Exception ex) {
-            SdkLog.Warn(Tag, "安装前置拦截失败，保持原版窗口处理：" + ex.GetBaseException().Message);
+            SdkLog.Warn(Tag, "安装前置拦截失败，保持原窗口处理：" + ex.GetBaseException().Message);
+            // Also clean up a partial installation (e.g. only one window patched).
             Uninstall();
         }
     }
 
-    private void Patch(MethodInfo patch, Type harmonyMethodType,
-        Type windowType, string targetName, string prefixName) {
-        MethodInfo? target = windowType.GetMethod(targetName,
-            BindingFlags.Public | BindingFlags.Instance, null,
-            new[] { typeof(BattlePlayerData), typeof(ShopAction) }, null);
-        MethodInfo? prefix = GetType().GetMethod(prefixName,
-            BindingFlags.NonPublic | BindingFlags.Static);
-        if (target == null || target.ReturnType != typeof(UniTask) || prefix == null)
-            throw new MissingMethodException(windowType.FullName, targetName + " / " + prefixName);
-
-        object? patchDescriptor = Activator.CreateInstance(harmonyMethodType, new object[] { prefix });
-        if (patchDescriptor == null) throw new InvalidOperationException("HarmonyMethod 创建失败");
-        var parameters = patch.GetParameters();
-        var args = new object?[parameters.Length];
-        args[0] = target;
-        args[1] = patchDescriptor;
-        patch.Invoke(_harmony, args);
+    private void InstallPatch(Type patchType) {
+        var replacements = _harmony!.CreateClassProcessor(patchType).Patch();
+        if (replacements == null || replacements.Count == 0)
+            throw new InvalidOperationException("Harmony 未注册目标补丁：" + patchType.Name);
     }
 
-    private void ResolveUnpatch(Type harmonyType) {
-        // HarmonyX: UnpatchSelf() / static UnpatchID(id)
-        // Harmony 2: UnpatchAll(id). Never invoke the global parameterless
-        // UnpatchAll(): that would remove OTHER mods' patches.
-        _unpatch = harmonyType.GetMethod("UnpatchSelf", BindingFlags.Public | BindingFlags.Instance,
-            null, Type.EmptyTypes, null);
-        _unpatchArgs = Array.Empty<object>();
-        if (_unpatch != null) return;
-        _unpatch = harmonyType.GetMethod("UnpatchID", BindingFlags.Public | BindingFlags.Static,
-            null, new[] { typeof(string) }, null);
-        _unpatchArgs = new object[] { PatchId };
-        if (_unpatch != null) return;
-        _unpatch = harmonyType.GetMethod("UnpatchAll", BindingFlags.Public | BindingFlags.Instance,
-            null, new[] { typeof(string) }, null);
-        _unpatchArgs = new object[] { PatchId };
+    [HarmonyPatch(typeof(LandRelicWindow), nameof(LandRelicWindow.ShowPurchase),
+        typeof(BattlePlayerData), typeof(ShopAction))]
+    private static class RelicPurchasePatch {
+        [HarmonyPrefix]
+        private static bool Prefix(BattlePlayerData playerData, ShopAction action, ref UniTask __result) {
+            var active = _active;
+            return active == null || !active.TrySkip(playerData, action, ShopKind.Relic, ref __result);
+        }
     }
 
-    private static bool RelicPrefix(BattlePlayerData playerData, ShopAction action, ref UniTask __result) {
-        var active = _active;
-        return active == null || !active.TrySkip(playerData, action, ShopKind.Relic, ref __result);
+    [HarmonyPatch(typeof(LandVendorWindow), nameof(LandVendorWindow.ShowVendorBuyCard),
+        typeof(BattlePlayerData), typeof(ShopAction))]
+    private static class VendorPurchasePatch {
+        [HarmonyPrefix]
+        private static bool Prefix(BattlePlayerData playerData, ShopAction action, ref UniTask __result) {
+            var active = _active;
+            return active == null || !active.TrySkip(playerData, action, ShopKind.Vendor, ref __result);
+        }
     }
 
-    private static bool VendorPrefix(BattlePlayerData playerData, ShopAction action, ref UniTask __result) {
-        var active = _active;
-        return active == null || !active.TrySkip(playerData, action, ShopKind.Vendor, ref __result);
-    }
-
-    private static bool BuildPrefix(BattlePlayerData playerData, ShopAction action, ref UniTask __result) {
-        var active = _active;
-        return active == null || !active.TrySkip(playerData, action, ShopKind.Building, ref __result);
+    [HarmonyPatch(typeof(LandBuildShopWindow), nameof(LandBuildShopWindow.ShowPurchase),
+        typeof(BattlePlayerData), typeof(ShopAction))]
+    private static class BuildPurchasePatch {
+        [HarmonyPrefix]
+        private static bool Prefix(BattlePlayerData playerData, ShopAction action, ref UniTask __result) {
+            var active = _active;
+            return active == null || !active.TrySkip(playerData, action, ShopKind.Building, ref __result);
+        }
     }
 
     private enum ShopKind { Relic, Vendor, Building }
@@ -233,19 +172,17 @@ internal sealed class ExperimentalEarlyShopSkipService {
     }
 
     private void Uninstall() {
-        // Stop our prefix before attempting removal; even if the runtime cannot
-        // undo a detour, the method will then ALWAYS allow the original to run.
+        // Disable our prefix logic first. On a detour-uninstall failure,
+        // any surviving Prefix will continue the original method unchanged.
         _installed = false;
         _active = null;
         try {
-            if (_unpatch != null)
-                _unpatch.Invoke(_unpatch.IsStatic ? null : _harmony, _unpatchArgs);
+            // Explicit owner ID: never remove another mod's Harmony patches.
+            _harmony?.UnpatchSelf();
         } catch (Exception ex) {
             SdkLog.Warn(Tag, "补丁卸载失败（已禁用逻辑），建议重启游戏：" + ex.GetBaseException().Message);
         } finally {
             _harmony = null;
-            _unpatch = null;
-            _unpatchArgs = null;
         }
     }
 }

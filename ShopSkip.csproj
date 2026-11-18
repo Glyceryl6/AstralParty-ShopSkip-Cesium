@@ -16,6 +16,9 @@
       <HintPath>refs\UnityEngine.InputLegacyModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>refs\0Harmony.dll</HintPath>
+    </Reference>
     <!-- CesiumLoader.SDK: apcsm new 已附带在 refs\ -->
     <Reference Include="CesiumLoader.SDK">
       <HintPath>refs\CesiumLoader.SDK.dll</HintPath>
