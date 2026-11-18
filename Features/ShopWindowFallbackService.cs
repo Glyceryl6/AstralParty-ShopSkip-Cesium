@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Text.RegularExpressions;
-using CesiumLoader.SDK.Logging;
 using FairyGUI;
 using GameLogic;
 using UI;
@@ -24,21 +23,8 @@ internal sealed class ShopWindowFallbackService {
 
     private readonly HashSet<BaseWindow> _handledPurchases = new HashSet<BaseWindow>();
     private float _nextPoll;
-    private bool _suspended;
 
-    internal void Tick(bool suspendForExperiment) {
-        if (suspendForExperiment) {
-            if (!_suspended) SdkLog.Warn("ShopSkip.WindowFallback",
-                "已暂停三个商店的窗口内自动取消；现在只由 Harmony Prefix 决定是否提前跳过。");
-            _suspended = true;
-            _handledPurchases.Clear();
-            _nextPoll = 0f;
-            return;
-        }
-        if (_suspended) {
-            _suspended = false;
-            SdkLog.Info("ShopSkip.WindowFallback", "实验暂停已解除，恢复三个商店的窗口内自动取消。");
-        }
+    internal void Tick() {
         if (Time.realtimeSinceStartup < _nextPoll) return;
         _nextPoll = Time.realtimeSinceStartup + .22f;
         if (!UIManager.hasInstance) { Reset(); return; }
@@ -94,6 +80,5 @@ internal sealed class ShopWindowFallbackService {
     internal void Reset() {
         _handledPurchases.Clear();
         _nextPoll = 0f;
-        _suspended = false;
     }
 }
