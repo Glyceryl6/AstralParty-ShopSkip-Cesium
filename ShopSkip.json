@@ -1,7 +1,7 @@
 {
   "id": "ShopSkip",
   "name": "商店跳过",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "author": "Glyceryl6",
   "description": "在经过商店时，如果自身的星币不足以购买，则会自动跳过。",
   "permissions": 1,

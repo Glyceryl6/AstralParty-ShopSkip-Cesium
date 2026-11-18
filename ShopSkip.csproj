@@ -5,7 +5,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>ShopSkip</AssemblyName>
     <RootNamespace>ShopSkip</RootNamespace>
-    <Version>0.1.3</Version>
+    <Version>0.1.4</Version>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="UnityEngine.CoreModule">
@@ -15,9 +15,6 @@
     <Reference Include="UnityEngine.InputLegacyModule">
       <HintPath>refs\UnityEngine.InputLegacyModule.dll</HintPath>
       <Private>false</Private>
-    </Reference>
-    <Reference Include="0Harmony">
-      <HintPath>refs\0Harmony.dll</HintPath>
     </Reference>
     <!-- CesiumLoader.SDK: apcsm new 已附带在 refs\ -->
     <Reference Include="CesiumLoader.SDK">
