@@ -15,14 +15,12 @@ using ShopAction = party.model.Action;
 namespace ShopSkip.Features;
 
 /// <summary>
-/// Optional SINGLE-PLAYER-only prefix experiment. Never enabled by default.
-/// No hard Harmony reference: the SDK can load ShopSkip even when Harmony
-/// cannot be resolved. The three non-card window fallbacks are deliberately
-/// suspended during a single-player opt-in experiment for unambiguous testing.
-///
-/// Requires an opt-in marker named experimental-early-skip.enable next to the
-/// mod DLL. An optional local 0Harmony.dll may be supplied for trial loading.
-/// Removing the marker and restarting completely disables this feature.
+/// Always-on experimental Harmony prefix for the three non-card shops.
+/// The stable window fallback is disabled while testing these prefixes.
+/// No hard Harmony reference: failure to resolve Harmony does not prevent
+/// loading the card shop / ATM features.
+/// For safety, only local-player actions with a confirmed positive price
+/// greater than available gold are eligible to be skipped.
 /// </summary>
 internal sealed class ExperimentalEarlyShopSkipService {
     private const string Tag = "ShopSkip.EarlyTest";
@@ -31,7 +29,7 @@ internal sealed class ExperimentalEarlyShopSkipService {
     private const int MaxReasonablePrice = 100_000_000;
 
     private static ExperimentalEarlyShopSkipService? _active;
-    private readonly HashSet<long> _completedActions = [];
+    private readonly HashSet<long> _completedActions = new HashSet<long>();
     private bool _attempted;
     private bool _installed;
     private bool _prefixSeen;
@@ -39,24 +37,30 @@ internal sealed class ExperimentalEarlyShopSkipService {
     private MethodInfo? _unpatch;
     private object[]? _unpatchArgs;
 
+    internal static void Initialize() {
+        SdkLog.Warn(Tag, "前置拦截实验已默认启用，所有对局模式均会尝试安装；三个商店的旧窗口取消逻辑暂停。" +
+            "若补丁不兼容，商店会照常打开。请勿在正式多人对局中测试。" );
+    }
+
+    // Always suspend the old non-card window check. In particular, installation
+    // failure must NOT be mistaken for a successful early prefix.
+    internal bool IsExperimentSessionActive => true;
+
     internal void Tick() {
+        // Attempt only once per scene, not once per frame. A failure is logged
+        // and the game retains the original shop window behavior.
         if (_installed || _attempted) return;
         _attempted = true;
+        SdkLog.Warn(Tag, "开始尝试安装三个商店的前置拦截（无单人模式与开关文件限制）。");
         TryInstall();
     }
 
     private void TryInstall() {
         try {
             string modDirectory = Path.Combine(SdkPath.ModsDirectory, "ShopSkip");
-            // Resolve after the opt-in and single-player checks: never put a
-            // HarmonyLib type in fields, signatures or attributes of this mod.
-            Assembly harmonyAssembly = LoadHarmony(modDirectory);
-            SdkLog.Info(Tag, "使用 Harmony 程序集：" + harmonyAssembly.GetName().FullName);
-
-            Type? harmonyType = harmonyAssembly.GetType("HarmonyLib.Harmony", false);
-            Type? methodType = harmonyAssembly.GetType("HarmonyLib.HarmonyMethod", false);
-            if (harmonyType == null || methodType == null)
-                throw new InvalidOperationException("Harmony 类型不可用");
+            // Do not put HarmonyLib types in fields, signatures or attributes.
+            (Type harmonyType, Type methodType) = ResolveHarmonyTypes(modDirectory);
+            SdkLog.Info(Tag, "使用 Harmony 程序集：" + harmonyType.Assembly.FullName);
 
             _harmony = Activator.CreateInstance(harmonyType, new object[] { PatchId });
             if (_harmony == null) throw new InvalidOperationException("无法创建 Harmony 实例");
@@ -79,67 +83,75 @@ internal sealed class ExperimentalEarlyShopSkipService {
             SdkLog.Warn(Tag, "已向 Harmony 注册三个商店入口（不代表 HybridCLR 已成功执行补丁）。" +
                 "请观察首次触发的 Prefix 日志；若无日志，商店正常打开且不会触发稳定自动取消。");
         } catch (Exception ex) {
-            SdkLog.Warn(Tag, "安装前置拦截失败；保留游戏原生窗口，实验期间不会触发窗口内自动取消：" + ex.GetBaseException().Message);
+            SdkLog.Warn(Tag, "前置拦截安装失败；仍暂停旧窗口取消，以便单独观察原版行为：" + ex.GetBaseException().Message);
             Uninstall();
         }
     }
 
-    private static Assembly LoadHarmony(string modDirectory) {
-        // An assembly with the same simple name may already have been loaded
-        // from another mod. Do not silently mix types from different versions.
-        foreach (Assembly loaded in AppDomain.CurrentDomain.GetAssemblies()) {
-            string? name;
-            try { name = loaded.GetName().Name; }
-            catch { continue; }
-            if (name != "0Harmony") continue;
-            if (loaded.GetType("HarmonyLib.Harmony", false) == null ||
-                loaded.GetType("HarmonyLib.HarmonyMethod", false) == null)
-                throw new InvalidOperationException(
-                    "已加载的 0Harmony 缺少 Harmony 2 类型，可能存在版本冲突：" +
-                    loaded.GetName().FullName);
-            return loaded;
+    // Assembly.GetType(...) is unavailable in some stripped IL2CPP builds.
+    // Look up assembly-qualified names via Type.GetType instead. This is a
+    // separate runtime capability and might also be stripped in some builds.
+    private static bool TryResolveTypes(out Type? harmony, out Type? harmonyMethod) {
+        harmony = Type.GetType("HarmonyLib.Harmony, 0Harmony");
+        harmonyMethod = Type.GetType("HarmonyLib.HarmonyMethod, 0Harmony");
+        return harmony != null && harmonyMethod != null &&
+               harmony.Assembly == harmonyMethod.Assembly;
+    }
+
+    private static (Type Harmony, Type HarmonyMethod) ResolveHarmonyTypes(string modDirectory) {
+        // Type.GetType may return a type from a 0Harmony already loaded by
+        // the loader. Do not load a second copy unless necessary.
+        Type? harmony = null;
+        Type? method = null;
+        Exception? existingError = null;
+        try {
+            if (TryResolveTypes(out harmony, out method))
+                return (harmony!, method!);
+        } catch (Exception ex) {
+            existingError = ex;
         }
 
         string dll = Path.Combine(modDirectory, HarmonyLibrary);
         if (!File.Exists(dll)) throw new FileNotFoundException(
-            "未找到可用的 0Harmony.dll，请将 DLL 放在 ShopSkip 目录", dll);
+            "无法找到 Harmony：运行时解析=" + (existingError?.GetBaseException().Message ?? "未解析到类型") +
+            "；Mod 目录也没有 0Harmony.dll", dll);
 
-        // LoadFrom works in some runtimes, byte loading works in others.
-        // Both may be unavailable on IL2CPP/HybridCLR; report the failure
-        // rather than pretending a patch was installed.
-        Exception? fromError;
+        Exception? loadFromError = null;
         try {
-            Assembly assembly = Assembly.LoadFrom(dll);
-            if (assembly.GetType("HarmonyLib.Harmony", false) != null &&
-                assembly.GetType("HarmonyLib.HarmonyMethod", false) != null)
-                return assembly;
-            throw new TypeLoadException("0Harmony 已加载，但不包含 HarmonyLib.Harmony / HarmonyMethod");
+            Assembly.LoadFrom(dll);
+            if (TryResolveTypes(out harmony, out method))
+                return (harmony!, method!);
         } catch (Exception ex) {
-            fromError = ex;
+            loadFromError = ex;
         }
+
+        Exception? loadBytesError = null;
         try {
-            Assembly assembly = Assembly.Load(File.ReadAllBytes(dll));
-            if (assembly.GetType("HarmonyLib.Harmony", false) != null &&
-                assembly.GetType("HarmonyLib.HarmonyMethod", false) != null)
-                return assembly;
-            throw new TypeLoadException("字节加载的 0Harmony 不包含 Harmony 2 API");
+            Assembly.Load(File.ReadAllBytes(dll));
+            if (TryResolveTypes(out harmony, out method))
+                return (harmony!, method!);
         } catch (Exception ex) {
-            throw new InvalidOperationException(
-                "Harmony 反射加载失败；LoadFrom=" + fromError.GetBaseException().Message +
-                "；Load(byte[])=" + ex.GetBaseException().Message, ex);
+            loadBytesError = ex;
         }
+
+        throw new InvalidOperationException(
+            "无法解析 Harmony 2 API（已绕过 Assembly.GetType）" +
+            "; Loaded=" + (existingError?.GetBaseException().Message ?? "未解析到类型") +
+            "; LoadFrom=" + (loadFromError?.GetBaseException().Message ?? "未解析到类型") +
+            "; Load(bytes)=" + (loadBytesError?.GetBaseException().Message ?? "未解析到类型"));
     }
 
     private void Patch(MethodInfo patch, Type harmonyMethodType,
         Type windowType, string targetName, string prefixName) {
         MethodInfo? target = windowType.GetMethod(targetName,
             BindingFlags.Public | BindingFlags.Instance, null,
-            [typeof(BattlePlayerData), typeof(ShopAction)], null);
-        MethodInfo? prefix = GetType().GetMethod(prefixName,
+            new[] { typeof(BattlePlayerData), typeof(ShopAction) }, null);
+        MethodInfo? prefix = typeof(ExperimentalEarlyShopSkipService).GetMethod(prefixName,
             BindingFlags.NonPublic | BindingFlags.Static);
         if (target == null || target.ReturnType != typeof(UniTask) || prefix == null)
             throw new MissingMethodException(windowType.FullName, targetName + " / " + prefixName);
-        object? patchDescriptor = Activator.CreateInstance(harmonyMethodType, prefix);
+
+        object? patchDescriptor = Activator.CreateInstance(harmonyMethodType, new object[] { prefix });
         if (patchDescriptor == null) throw new InvalidOperationException("HarmonyMethod 创建失败");
         var parameters = patch.GetParameters();
         var args = new object?[parameters.Length];
@@ -154,15 +166,15 @@ internal sealed class ExperimentalEarlyShopSkipService {
         // UnpatchAll(): that would remove OTHER mods' patches.
         _unpatch = harmonyType.GetMethod("UnpatchSelf", BindingFlags.Public | BindingFlags.Instance,
             null, Type.EmptyTypes, null);
-        _unpatchArgs = [];
+        _unpatchArgs = Array.Empty<object>();
         if (_unpatch != null) return;
         _unpatch = harmonyType.GetMethod("UnpatchID", BindingFlags.Public | BindingFlags.Static,
-            null, [typeof(string)], null);
-        _unpatchArgs = [PatchId];
+            null, new[] { typeof(string) }, null);
+        _unpatchArgs = new object[] { PatchId };
         if (_unpatch != null) return;
         _unpatch = harmonyType.GetMethod("UnpatchAll", BindingFlags.Public | BindingFlags.Instance,
-            null, [typeof(string)], null);
-        _unpatchArgs = [PatchId];
+            null, new[] { typeof(string) }, null);
+        _unpatchArgs = new object[] { PatchId };
     }
 
     private static bool RelicPrefix(BattlePlayerData playerData, ShopAction action, ref UniTask __result) {
@@ -183,11 +195,12 @@ internal sealed class ExperimentalEarlyShopSkipService {
     private enum ShopKind { Relic, Vendor, Building }
 
     /// <summary>
-    /// True means: a real, local, single-player offer has been cancelled;
+    /// True means: a real, local-player offer has been cancelled;
     /// Harmony should skip only the original UI opening method.
     /// Any incomplete or ambiguous state returns false (original runs).
     /// </summary>
-    private bool TrySkip(BattlePlayerData? playerData, ShopAction? action, ShopKind kind, ref UniTask result) {
+    private bool TrySkip(BattlePlayerData? playerData, ShopAction? action,
+        ShopKind kind, ref UniTask result) {
         if (!_installed) return false;
         if (!_prefixSeen) {
             _prefixSeen = true;
@@ -236,7 +249,7 @@ internal sealed class ExperimentalEarlyShopSkipService {
             }
             _completedActions.Add(action.Sn);
             result = UniTask.CompletedTask;
-            SdkLog.Info(Tag, "单人提前跳过 " + kind + "：余额=" + gold +
+            SdkLog.Info(Tag, "提前跳过 " + kind + "：余额=" + gold +
                 "，价格=" + price + "，操作=" + action.Sn);
             return true;
         } catch (Exception ex) {
