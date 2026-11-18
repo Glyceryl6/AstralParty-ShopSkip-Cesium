@@ -13,7 +13,7 @@ namespace ShopSkip.Features;
 /// <summary>
 /// Stable, window-based cancellation for relic, vendor and building shops.
 /// Completely independent of the card shop/ATM and the experimental Harmony prefix.
-/// The opt-in single-player experiment suspends this service even when patching fails,
+/// The always-on experiment suspends this service even when patching fails,
 /// so a normal Cancel click cannot be mistaken for a successful Prefix.
 /// </summary>
 internal sealed class ShopWindowFallbackService {
@@ -29,7 +29,7 @@ internal sealed class ShopWindowFallbackService {
     internal void Tick(bool suspendForExperiment) {
         if (suspendForExperiment) {
             if (!_suspended) SdkLog.Warn("ShopSkip.WindowFallback",
-                "已暂停三个商店的窗口内自动取消；单人实验只由 Harmony Prefix 决定是否提前跳过。");
+                "已暂停三个商店的窗口内自动取消；现在只由 Harmony Prefix 决定是否提前跳过。");
             _suspended = true;
             _handledPurchases.Clear();
             _nextPoll = 0f;
